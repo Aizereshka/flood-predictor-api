@@ -21,11 +21,11 @@ except FileNotFoundError as e:
     print(f"CRITICAL FILE ERROR: {e}")
     raise e
 
-# !!! ДОБАВЛЕНО: Извлекаем ожидаемый порядок и имена столбцов из модели !!!
+# Извлекаем ожидаемый порядок и имена столбцов из модели
 EXPECTED_FEATURES = model.feature_names_
-# Убедимся, что ненужный столбец 'Unnamed: 0' удален из ожидаемых признаков
-if 'Unnamed: 0' in EXPECTED_FEATURES:
-    EXPECTED_FEATURES.remove('Unnamed: 0')
+# На этот раз мы НЕ удаляем 'Unnamed: 0' из списка ожидаемых признаков.
+# Мы просто убедимся, что он есть в списке, чтобы его порядок был соблюден.
+# Если он не удаляется (как мы видели), то он остается в EXPECTED_FEATURES.
     
 df_history["date"] = pd.to_datetime(df_history["date"], errors="coerce")
 
@@ -64,6 +64,8 @@ class InputData(BaseModel):
 # ================= FEATURE ENGINEERING =================
 def create_input_data(data: InputData):
     df = pd.DataFrame([{
+        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Добавляем Unnamed: 0 на позицию 0 !!!
+        "Unnamed: 0": 0,
         "water_level": data.water_level,
         "soil_moisture_avg": data.soil_moisture_avg,
         "temp_avg": data.temp_avg,
@@ -96,16 +98,17 @@ def predict(data: InputData):
     # 1. Создаем признаки
     df_input = create_input_data(data)
     
-    # 2. !!! КРИТИЧЕСКИЙ ШАГ: Переставляем столбцы в ожидаемом порядке и удаляем ненужные
+    # 2. !!! ИСПРАВЛЕНИЕ: Оставляем столбцы в порядке, который ожидает CatBoost, 
+    # включая Unnamed: 0
     try:
         df_input = df_input[EXPECTED_FEATURES]
     except KeyError as e:
-        # Это произойдет, если мы забыли создать какой-то признак
+        # Эта ошибка должна показать, что мы забыли создать какой-то признак
         raise HTTPException(status_code=500, detail=f"Missing feature: {e}. Check EXPECTED_FEATURES.")
     
     # 3. Очистка и преобразование типов
     for col in df_input.columns:
-        if col not in CATEGORICAL_COLS:
+        if col not in CATEGORICAL_COLS and col != 'Unnamed: 0': # Игнорируем Unnamed: 0 при проверке
             df_input[col] = pd.to_numeric(df_input[col], errors='coerce').fillna(MEDIAN_VALUES.get(col, 0))
     
     # 4. Прогноз
