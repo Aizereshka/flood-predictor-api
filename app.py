@@ -1,16 +1,15 @@
-from fastapi import FastAPI, HTTPException # ДОБАВЛЕН HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
 import joblib
 import os
 from catboost import Pool
-from datetime import datetime # Добавлен импорт, чтобы избежать ошибок, хотя напрямую не используется
+from datetime import datetime
 
 app = FastAPI(title="Flood Risk Prediction API")
 
 # ================= LOAD FILES =================
-# Используем надежные абсолютные пути
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "catboost_flood_cv_final.joblib")
 DATA_PATH = os.path.join(BASE_DIR, "flood-kz.csv")
@@ -19,10 +18,15 @@ try:
     model = joblib.load(MODEL_PATH)
     df_history = pd.read_csv(DATA_PATH, low_memory=False)
 except FileNotFoundError as e:
-    # Критическая ошибка: файл не найден при запуске сервера
     print(f"CRITICAL FILE ERROR: {e}")
     raise e
 
+# !!! ДОБАВЛЕНО: Извлекаем ожидаемый порядок и имена столбцов из модели !!!
+EXPECTED_FEATURES = model.feature_names_
+# Убедимся, что ненужный столбец 'Unnamed: 0' удален из ожидаемых признаков
+if 'Unnamed: 0' in EXPECTED_FEATURES:
+    EXPECTED_FEATURES.remove('Unnamed: 0')
+    
 df_history["date"] = pd.to_datetime(df_history["date"], errors="coerce")
 
 # ================= FEATURES =================
@@ -75,15 +79,13 @@ def create_input_data(data: InputData):
     df["region"] = static.get("region", "Unknown")
     df["major_city"] = static.get("major_city", "Unknown")
 
-    # Преобразование даты в признак 'season'
     date_obj = pd.to_datetime(data.date, errors='coerce')
     if pd.isna(date_obj):
-        # Если дата неверна, используем медианный месяц (например, апрель)
         month = 4
     else:
         month = date_obj.month
         
-    df["season"] = (month % 12 // 3) + 1 # 1:Зима, 2:Весна, 3:Лето, 4:Осень
+    df["season"] = (month % 12 // 3) + 1
 
     return df
 
@@ -94,24 +96,28 @@ def predict(data: InputData):
     # 1. Создаем признаки
     df_input = create_input_data(data)
     
-    # 2. Очистка и преобразование типов (наиболее частая причина сбоя 500)
+    # 2. !!! КРИТИЧЕСКИЙ ШАГ: Переставляем столбцы в ожидаемом порядке и удаляем ненужные
+    try:
+        df_input = df_input[EXPECTED_FEATURES]
+    except KeyError as e:
+        # Это произойдет, если мы забыли создать какой-то признак
+        raise HTTPException(status_code=500, detail=f"Missing feature: {e}. Check EXPECTED_FEATURES.")
+    
+    # 3. Очистка и преобразование типов
     for col in df_input.columns:
         if col not in CATEGORICAL_COLS:
-            # Принудительное преобразование в число с заполнением медианами
             df_input[col] = pd.to_numeric(df_input[col], errors='coerce').fillna(MEDIAN_VALUES.get(col, 0))
     
-    # 3. Прогноз
+    # 4. Прогноз
     try:
         pool = Pool(df_input, cat_features=CATEGORICAL_COLS)
         prob = model.predict_proba(pool)[0][1]
     
     except Exception as e:
-        # Если CatBoost падает, возвращаем 500 с деталями, чтобы увидеть ошибку в логах Render
         print(f"CRITICAL ERROR IN CATBOOST PREDICTION: {e}")
-        # Возвращаем HTTPException, чтобы увидеть сообщение на стороне клиента
         raise HTTPException(status_code=500, detail=f"Prediction failed: Check logs for details. Error: {e}")
 
-    # 4. Возвращаем результат
+    # 5. Возвращаем результат
     return {
         "prob_flood": float(prob),
         "prediction": int(prob > 0.5)
