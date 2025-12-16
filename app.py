@@ -15,17 +15,18 @@ MODEL_PATH = os.path.join(BASE_DIR, "catboost_flood_cv_final.joblib")
 DATA_PATH = os.path.join(BASE_DIR, "flood-kz.csv")
 
 try:
+    # Загрузка модели и исторических данных
     model = joblib.load(MODEL_PATH)
     df_history = pd.read_csv(DATA_PATH, low_memory=False)
 except FileNotFoundError as e:
     print(f"CRITICAL FILE ERROR: {e}")
+    # Поднимаем исключение, чтобы Render упал, если файлы не найдены
     raise e
 
 # Извлекаем ожидаемый порядок и имена столбцов из модели
 EXPECTED_FEATURES = model.feature_names_
-# На этот раз мы НЕ удаляем 'Unnamed: 0' из списка ожидаемых признаков.
-# Мы просто убедимся, что он есть в списке, чтобы его порядок был соблюден.
-# Если он не удаляется (как мы видели), то он остается в EXPECTED_FEATURES.
+
+# Удаление/переименование столбца не требуется. CatBoost требует его наличия.
     
 df_history["date"] = pd.to_datetime(df_history["date"], errors="coerce")
 
@@ -52,7 +53,7 @@ static_map = (
 
 CATEGORICAL_COLS = ["region", "major_city", "basin", "season"]
 
-# ================= INPUT =================
+# ================= INPUT Pydantic Model =================
 class InputData(BaseModel):
     date: str
     basin: str
@@ -63,8 +64,11 @@ class InputData(BaseModel):
 
 # ================= FEATURE ENGINEERING =================
 def create_input_data(data: InputData):
+    
+    # Создание датафрейма с входными данными. 
+    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Добавляем Unnamed: 0 на позицию 0 (или близко к ней) 
+    # с пустым значением 0, чтобы удовлетворить модель CatBoost.
     df = pd.DataFrame([{
-        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Добавляем Unnamed: 0 на позицию 0 !!!
         "Unnamed: 0": 0,
         "water_level": data.water_level,
         "soil_moisture_avg": data.soil_moisture_avg,
@@ -73,6 +77,7 @@ def create_input_data(data: InputData):
         "basin": data.basin
     }])
 
+    # Добавление статических признаков бассейна
     static = static_map.get(data.basin, {})
 
     for col in NUM_STATIC_COLS:
@@ -81,12 +86,14 @@ def create_input_data(data: InputData):
     df["region"] = static.get("region", "Unknown")
     df["major_city"] = static.get("major_city", "Unknown")
 
+    # Создание признака 'season'
     date_obj = pd.to_datetime(data.date, errors='coerce')
     if pd.isna(date_obj):
         month = 4
     else:
         month = date_obj.month
         
+    # Преобразование месяца в сезон (1:Зима, 2:Весна, 3:Лето, 4:Осень)
     df["season"] = (month % 12 // 3) + 1
 
     return df
@@ -98,17 +105,17 @@ def predict(data: InputData):
     # 1. Создаем признаки
     df_input = create_input_data(data)
     
-    # 2. !!! ИСПРАВЛЕНИЕ: Оставляем столбцы в порядке, который ожидает CatBoost, 
-    # включая Unnamed: 0
+    # 2. Переставляем столбцы в ТОЧНОМ порядке, который ожидает CatBoost (включая Unnamed: 0)
     try:
         df_input = df_input[EXPECTED_FEATURES]
     except KeyError as e:
-        # Эта ошибка должна показать, что мы забыли создать какой-то признак
-        raise HTTPException(status_code=500, detail=f"Missing feature: {e}. Check EXPECTED_FEATURES.")
+        # Если не хватает какого-то ожидаемого признака
+        raise HTTPException(status_code=500, detail=f"Missing feature expected by model: {e}. Check FEATURE ENGINEERING.")
     
-    # 3. Очистка и преобразование типов
+    # 3. Очистка и преобразование типов (для всех числовых, кроме Unnamed: 0)
     for col in df_input.columns:
-        if col not in CATEGORICAL_COLS and col != 'Unnamed: 0': # Игнорируем Unnamed: 0 при проверке
+        if col not in CATEGORICAL_COLS and col != 'Unnamed: 0': 
+            # Принудительное преобразование в число с заполнением медианами
             df_input[col] = pd.to_numeric(df_input[col], errors='coerce').fillna(MEDIAN_VALUES.get(col, 0))
     
     # 4. Прогноз
@@ -117,7 +124,9 @@ def predict(data: InputData):
         prob = model.predict_proba(pool)[0][1]
     
     except Exception as e:
+        # Захват и вывод любой ошибки CatBoost в логах Render
         print(f"CRITICAL ERROR IN CATBOOST PREDICTION: {e}")
+        # Возвращаем 500 с деталями клиенту
         raise HTTPException(status_code=500, detail=f"Prediction failed: Check logs for details. Error: {e}")
 
     # 5. Возвращаем результат
